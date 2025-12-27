@@ -1,0 +1,17 @@
+# Telegram Bot Configuration
+TELEGRAM_TOKEN=your_telegram_bot_token_here
+
+# MongoDB Configuration (Optional)
+MONGODB_URI=mongodb+srv://username:password@cluster.mongodb.net/database_name?retryWrites=true&w=majority
+
+# Render Configuration (Auto-set by Render)
+RENDER_EXTERNAL_URL=https://your-bot-name.onrender.com
+
+# Application Settings
+MAX_FILE_SIZE_MB=20
+TEMP_FILE_EXPIRY_MINUTES=60
+LOG_LEVEL=INFO
+
+# Security
+ENABLE_RATE_LIMITING=true
+MAX_REQUESTS_PER_MINUTE=10
