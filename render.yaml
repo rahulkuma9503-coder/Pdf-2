@@ -4,18 +4,10 @@ services:
     env: python
     region: oregon
     plan: free
-    buildCommand: |
-      pip install --upgrade pip
-      pip install -r requirements.txt
-      mkdir -p logs
+    buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
-    healthCheckPath: /health
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.9
       - key: TELEGRAM_TOKEN
-        sync: false
-      - key: MONGODB_URI
         sync: false
       - key: RENDER_EXTERNAL_URL
         fromService:
@@ -23,3 +15,4 @@ services:
           name: pdf-telegram-bot
           property: url
     autoDeploy: true
+    healthCheckPath: /health
