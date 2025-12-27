@@ -1,27 +1,18 @@
 #!/usr/bin/env python3
 """
-Telegram PDF Utility Bot
-Hosted on Render.com
+Telegram PDF Utility Bot - Fixed for Render
 """
 
 import os
+import sys
+import time
 import tempfile
 import logging
 from datetime import datetime
 from pathlib import Path
-from flask import Flask, request, jsonify
-import telebot
-from telebot.types import (
-    InlineKeyboardMarkup, 
-    InlineKeyboardButton,
-    ReplyKeyboardMarkup
-)
 
-# Local imports
-from pdf_processor import PDFProcessor
-from session_manager import SessionManager
-from utils.validators import FileValidator
-from utils.file_cleaner import TempFileManager
+# Add current directory to path
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Load environment variables
 from dotenv import load_dotenv
@@ -30,23 +21,73 @@ load_dotenv()
 # Configuration
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 MONGODB_URI = os.getenv('MONGODB_URI', '')
-WEBHOOK_URL = os.getenv('RENDER_EXTERNAL_URL', '') + '/webhook'
+RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '')
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
 
-# Initialize components
+# Initialize logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('logs/bot.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Import Telegram bot
+import telebot
+from telebot import types
+
+# Initialize bot
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
-app = Flask(__name__)
-session_manager = SessionManager(MONGODB_URI) if MONGODB_URI else None
+
+# Import local modules
+try:
+    from pdf_processor import PDFProcessor
+    from session_manager import SessionManager
+    from utils.validators import FileValidator
+    from utils.file_cleaner import TempFileManager
+except ImportError as e:
+    logger.error(f"Import error: {e}")
+    # Create fallback implementations
+    class PDFProcessor:
+        def merge_pdfs(self, *args, **kwargs):
+            raise NotImplementedError("PDFProcessor not available")
+    
+    class SessionManager:
+        def __init__(self, *args, **kwargs):
+            self.sessions = {}
+        
+        def get_session(self, chat_id):
+            return self.sessions.get(chat_id, {})
+        
+        def update_session(self, chat_id, **kwargs):
+            if chat_id not in self.sessions:
+                self.sessions[chat_id] = {}
+            self.sessions[chat_id].update(kwargs)
+    
+    class FileValidator:
+        def is_pdf_file(self, filename):
+            return filename.lower().endswith('.pdf')
+    
+    class TempFileManager:
+        def __init__(self):
+            self.temp_dir = tempfile.mkdtemp()
+    
+    logger.warning("Using fallback implementations")
+
+# Initialize components
 pdf_processor = PDFProcessor()
 file_validator = FileValidator(max_size=MAX_FILE_SIZE)
 temp_manager = TempFileManager()
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Use MongoDB if URI is provided, otherwise use memory
+if MONGODB_URI and MONGODB_URI != 'your_mongodb_uri_here':
+    session_manager = SessionManager(MONGODB_URI)
+else:
+    # Use simple memory session manager
+    session_manager = SessionManager('')
 
 # Bot States
 class BotState:
@@ -59,41 +100,44 @@ class BotState:
     WAITING_WATERMARK_POSITION = "waiting_watermark_position"
     WAITING_WATERMARK_OPACITY = "waiting_watermark_opacity"
 
+# Flask app for webhook
+from flask import Flask, request, jsonify
+app = Flask(__name__)
+
 # Helper Functions
 def get_main_menu():
     """Create main menu keyboard"""
-    markup = InlineKeyboardMarkup(row_width=2)
+    markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = [
-        InlineKeyboardButton("📄 Merge PDFs", callback_data='merge'),
-        InlineKeyboardButton("✏️ Rename PDF", callback_data='rename'),
-        InlineKeyboardButton("💧 Add Watermark", callback_data='watermark'),
-        InlineKeyboardButton("❓ Help", callback_data='help'),
-        InlineKeyboardButton("🗑️ Clear Session", callback_data='clear')
+        types.InlineKeyboardButton("📄 Merge PDFs", callback_data='merge'),
+        types.InlineKeyboardButton("✏️ Rename PDF", callback_data='rename'),
+        types.InlineKeyboardButton("💧 Add Watermark", callback_data='watermark'),
+        types.InlineKeyboardButton("❓ Help", callback_data='help'),
+        types.InlineKeyboardButton("🗑️ Clear Session", callback_data='clear')
     ]
-    markup.add(*buttons)
+    markup.add(*buttons[:3])
+    markup.add(*buttons[3:])
     return markup
 
 def get_watermark_position_menu():
     """Create watermark position selection keyboard"""
-    markup = InlineKeyboardMarkup(row_width=2)
+    markup = types.InlineKeyboardMarkup(row_width=2)
     positions = [
         ('Center', 'center'),
         ('Top', 'top'),
         ('Bottom', 'bottom'),
-        ('Diagonal', 'diagonal'),
-        ('Every Page Corner', 'corners')
+        ('Diagonal', 'diagonal')
     ]
     for text, data in positions:
-        markup.add(InlineKeyboardButton(text, callback_data=f'pos_{data}'))
+        markup.add(types.InlineKeyboardButton(text, callback_data=f'pos_{data}'))
     return markup
 
 def get_opacity_menu():
     """Create opacity selection keyboard"""
-    markup = InlineKeyboardMarkup(row_width=3)
+    markup = types.InlineKeyboardMarkup(row_width=4)
     opacities = ['0.3', '0.5', '0.7', '0.9']
     for op in opacities:
-        markup.add(InlineKeyboardButton(f"{op}", callback_data=f"op_{op}"))
-    markup.add(InlineKeyboardButton("Custom", callback_data="op_custom"))
+        markup.add(types.InlineKeyboardButton(f"{op}", callback_data=f"op_{op}"))
     return markup
 
 # Command Handlers
@@ -123,11 +167,10 @@ I can help you with:
     )
     
     # Initialize session
-    if session_manager:
-        session_manager.create_session(
-            chat_id=message.chat.id,
-            state=BotState.WAITING
-        )
+    session_manager.update_session(
+        chat_id=message.chat.id,
+        state=BotState.WAITING
+    )
 
 @bot.message_handler(commands=['help'])
 def send_help(message):
@@ -146,18 +189,18 @@ def send_help(message):
 ⚠️ *Important:*
 • Only PDF files accepted
 • Max file size: 20MB
-• Files are deleted after 1 hour automatically
+• Files are deleted after processing
 • One operation at a time
-
-Need help? Contact admin.
 """
     bot.send_message(message.chat.id, help_text, parse_mode='Markdown')
 
 @bot.message_handler(commands=['cancel'])
 def cancel_operation(message):
     """Cancel current operation"""
-    if session_manager:
-        session_manager.clear_session(message.chat.id)
+    session_manager.update_session(
+        message.chat.id,
+        state=BotState.WAITING
+    )
     
     bot.send_message(
         message.chat.id,
@@ -190,6 +233,8 @@ def handle_callback_query(call):
             handle_watermark_position(chat_id, call.data, call.id)
         elif call.data.startswith('op_'):
             handle_watermark_opacity(chat_id, call.data, call.id)
+        else:
+            bot.answer_callback_query(call.id, "Unknown command")
         
     except Exception as e:
         logger.error(f"Callback error: {e}")
@@ -201,12 +246,11 @@ def handle_callback_query(call):
 
 def handle_merge_start(chat_id, message_id):
     """Start merge operation"""
-    if session_manager:
-        session_manager.update_session(
-            chat_id,
-            state=BotState.UPLOADING_MERGE,
-            data={'files': []}
-        )
+    session_manager.update_session(
+        chat_id,
+        state=BotState.UPLOADING_MERGE,
+        data={'files': []}
+    )
     
     instruction = """
 📄 *Merge PDFs Mode*
@@ -221,23 +265,32 @@ def handle_merge_start(chat_id, message_id):
 
 Send your first PDF file now...
 """
-    bot.edit_message_text(
-        instruction,
-        chat_id,
-        message_id,
-        parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup().add(
-            InlineKeyboardButton("❌ Cancel", callback_data='clear')
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("❌ Cancel", callback_data='clear'))
+    
+    try:
+        bot.edit_message_text(
+            instruction,
+            chat_id,
+            message_id,
+            parse_mode='Markdown',
+            reply_markup=markup
         )
-    )
+    except:
+        bot.send_message(
+            chat_id,
+            instruction,
+            parse_mode='Markdown',
+            reply_markup=markup
+        )
 
 def handle_rename_start(chat_id, message_id):
     """Start rename operation"""
-    if session_manager:
-        session_manager.update_session(
-            chat_id,
-            state=BotState.UPLOADING_RENAME
-        )
+    session_manager.update_session(
+        chat_id,
+        state=BotState.UPLOADING_RENAME
+    )
     
     instruction = """
 ✏️ *Rename PDF Mode*
@@ -247,23 +300,32 @@ I'll ask for the new filename afterwards.
 
 ⚠️ *Note:* Only PDF files accepted, max 20MB
 """
-    bot.edit_message_text(
-        instruction,
-        chat_id,
-        message_id,
-        parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup().add(
-            InlineKeyboardButton("❌ Cancel", callback_data='clear')
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("❌ Cancel", callback_data='clear'))
+    
+    try:
+        bot.edit_message_text(
+            instruction,
+            chat_id,
+            message_id,
+            parse_mode='Markdown',
+            reply_markup=markup
         )
-    )
+    except:
+        bot.send_message(
+            chat_id,
+            instruction,
+            parse_mode='Markdown',
+            reply_markup=markup
+        )
 
 def handle_watermark_start(chat_id, message_id):
     """Start watermark operation"""
-    if session_manager:
-        session_manager.update_session(
-            chat_id,
-            state=BotState.UPLOADING_WATERMARK
-        )
+    session_manager.update_session(
+        chat_id,
+        state=BotState.UPLOADING_WATERMARK
+    )
     
     instruction = """
 💧 *Add Watermark Mode*
@@ -276,37 +338,45 @@ Then I'll ask for:
 
 ⚠️ *Note:* Only PDF files accepted, max 20MB
 """
-    bot.edit_message_text(
-        instruction,
-        chat_id,
-        message_id,
-        parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup().add(
-            InlineKeyboardButton("❌ Cancel", callback_data='clear')
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("❌ Cancel", callback_data='clear'))
+    
+    try:
+        bot.edit_message_text(
+            instruction,
+            chat_id,
+            message_id,
+            parse_mode='Markdown',
+            reply_markup=markup
         )
-    )
+    except:
+        bot.send_message(
+            chat_id,
+            instruction,
+            parse_mode='Markdown',
+            reply_markup=markup
+        )
 
 def handle_clear_session(chat_id, message_id, callback_id=None):
     """Clear user session"""
-    if session_manager:
-        session_manager.clear_session(chat_id)
+    session_manager.update_session(
+        chat_id,
+        state=BotState.WAITING,
+        data={}
+    )
     
     if callback_id:
         bot.answer_callback_query(callback_id, "✅ Session cleared")
     
-    bot.edit_message_text(
-        "✅ Session cleared. What would you like to do?",
+    bot.send_message(
         chat_id,
-        message_id,
+        "✅ Session cleared. What would you like to do?",
         reply_markup=get_main_menu()
     )
 
 def handle_merge_confirm(chat_id, message_id, callback_id):
     """Confirm and process merge"""
-    if not session_manager:
-        bot.answer_callback_query(callback_id, "❌ Session not available")
-        return
-    
     session = session_manager.get_session(chat_id)
     if not session or 'files' not in session.get('data', {}):
         bot.answer_callback_query(callback_id, "❌ No files to merge")
@@ -323,18 +393,11 @@ def handle_merge_confirm(chat_id, message_id, callback_id):
     
     # Process merge
     bot.answer_callback_query(callback_id, "🔄 Merging PDFs...")
-    bot.edit_message_text(
-        "🔄 Merging your PDFs... This may take a moment.",
-        chat_id,
-        message_id
-    )
+    bot.send_message(chat_id, "🔄 Merging your PDFs... This may take a moment.")
     
     try:
         # Create temp output file
-        with tempfile.NamedTemporaryFile(
-            suffix='_merged.pdf', 
-            delete=False
-        ) as tmp_file:
+        with tempfile.NamedTemporaryFile(suffix='_merged.pdf', delete=False) as tmp_file:
             output_path = tmp_file.name
         
         # Merge PDFs
@@ -350,13 +413,16 @@ def handle_merge_confirm(chat_id, message_id, callback_id):
             )
         
         # Cleanup
-        os.unlink(output_path)
-        for file_path in files:
-            if os.path.exists(file_path):
-                os.unlink(file_path)
+        try:
+            os.unlink(output_path)
+            for file_path in files:
+                if os.path.exists(file_path):
+                    os.unlink(file_path)
+        except:
+            pass
         
         # Clear session
-        session_manager.clear_session(chat_id)
+        session_manager.update_session(chat_id, state=BotState.WAITING, data={})
         
         # Show main menu
         bot.send_message(
@@ -367,26 +433,20 @@ def handle_merge_confirm(chat_id, message_id, callback_id):
         
     except Exception as e:
         logger.error(f"Merge error: {e}")
-        bot.edit_message_text(
-            f"❌ Error merging PDFs: {str(e)}",
-            chat_id,
-            message_id
-        )
         bot.send_message(
             chat_id,
-            "Please try again or use /cancel",
-            reply_markup=get_main_menu()
+            f"❌ Error merging PDFs: {str(e)[:200]}"
         )
 
 def handle_watermark_position(chat_id, callback_data, callback_id):
     """Handle watermark position selection"""
     position = callback_data.replace('pos_', '')
     
-    if session_manager:
-        session = session_manager.get_session(chat_id)
-        if session:
-            session['data']['position'] = position
-            session_manager.update_session(chat_id, data=session['data'])
+    session = session_manager.get_session(chat_id)
+    if session:
+        data = session.get('data', {})
+        data['position'] = position
+        session_manager.update_session(chat_id, data=data)
     
     bot.answer_callback_query(callback_id, f"✅ Position: {position}")
     
@@ -401,20 +461,6 @@ def handle_watermark_position(chat_id, callback_data, callback_id):
 
 def handle_watermark_opacity(chat_id, callback_data, callback_id):
     """Handle watermark opacity selection"""
-    if callback_data == 'op_custom':
-        bot.answer_callback_query(callback_id)
-        bot.send_message(
-            chat_id,
-            "Please enter opacity value (0.1 to 1.0):\n"
-            "Example: 0.5 for 50% transparency"
-        )
-        if session_manager:
-            session_manager.update_session(
-                chat_id,
-                state=BotState.WAITING_WATERMARK_OPACITY
-            )
-        return
-    
     opacity = float(callback_data.replace('op_', ''))
     bot.answer_callback_query(callback_id, f"✅ Opacity: {opacity}")
     
@@ -440,7 +486,7 @@ def handle_document(message):
         return
     
     # Check file size
-    if message.document.file_size > MAX_FILE_SIZE:
+    if message.document.file_size and message.document.file_size > MAX_FILE_SIZE:
         bot.reply_to(
             message,
             f"❌ File too large. Max size: {MAX_FILE_SIZE // 1024 // 1024}MB"
@@ -454,27 +500,25 @@ def handle_document(message):
         downloaded_file = bot.download_file(file_info.file_path)
         
         # Save to temp file
-        with tempfile.NamedTemporaryFile(
+        temp_file = tempfile.NamedTemporaryFile(
             suffix='.pdf',
             delete=False,
             dir=temp_manager.temp_dir
-        ) as tmp_file:
-            tmp_file.write(downloaded_file)
-            file_path = tmp_file.name
+        )
+        temp_file.write(downloaded_file)
+        temp_file.close()
+        file_path = temp_file.name
         
         # Handle based on current state
-        if session_manager:
-            session = session_manager.get_session(chat_id)
-            state = session.get('state', BotState.WAITING) if session else BotState.WAITING
-        else:
-            state = BotState.WAITING
+        session = session_manager.get_session(chat_id)
+        state = session.get('state', BotState.WAITING) if session else BotState.WAITING
         
         if state == BotState.UPLOADING_MERGE:
-            handle_merge_file(chat_id, file_path, file_name, message.message_id)
+            handle_merge_file(chat_id, file_path, file_name)
         elif state == BotState.UPLOADING_RENAME:
-            handle_rename_file(chat_id, file_path, message.message_id)
+            handle_rename_file(chat_id, file_path)
         elif state == BotState.UPLOADING_WATERMARK:
-            handle_watermark_file(chat_id, file_path, message.message_id)
+            handle_watermark_file(chat_id, file_path)
         else:
             bot.reply_to(
                 message,
@@ -485,34 +529,33 @@ def handle_document(message):
             
     except Exception as e:
         logger.error(f"File handling error: {e}")
-        bot.reply_to(message, f"❌ Error processing file: {str(e)}")
+        bot.reply_to(message, f"❌ Error processing file: {str(e)[:200]}")
 
-def handle_merge_file(chat_id, file_path, file_name, message_id):
+def handle_merge_file(chat_id, file_path, file_name):
     """Handle file upload for merge"""
-    if not session_manager:
-        bot.send_message(chat_id, "❌ Session error")
-        return
-    
     session = session_manager.get_session(chat_id)
     if not session:
         bot.send_message(chat_id, "❌ Session expired. Please start again.")
         return
     
     # Add file to session
-    if 'files' not in session['data']:
-        session['data']['files'] = []
+    data = session.get('data', {})
+    if 'files' not in data:
+        data['files'] = []
     
-    session['data']['files'].append(file_path)
-    session_manager.update_session(chat_id, data=session['data'])
+    data['files'].append(file_path)
+    session_manager.update_session(chat_id, data=data)
     
     # Show confirmation options
-    file_count = len(session['data']['files'])
-    markup = InlineKeyboardMarkup()
-    markup.add(
-        InlineKeyboardButton(f"✅ Confirm Merge ({file_count} files)", callback_data='confirm_merge'),
-        InlineKeyboardButton("➕ Add More PDFs", callback_data='merge'),
-        InlineKeyboardButton("❌ Cancel", callback_data='clear')
-    )
+    file_count = len(data['files'])
+    markup = types.InlineKeyboardMarkup()
+    if file_count >= 2:
+        markup.add(types.InlineKeyboardButton(
+            f"✅ Confirm Merge ({file_count} files)", 
+            callback_data='confirm_merge'
+        ))
+    markup.add(types.InlineKeyboardButton("➕ Add More PDFs", callback_data='merge'))
+    markup.add(types.InlineKeyboardButton("❌ Cancel", callback_data='clear'))
     
     bot.send_message(
         chat_id,
@@ -523,15 +566,14 @@ def handle_merge_file(chat_id, file_path, file_name, message_id):
         reply_markup=markup
     )
 
-def handle_rename_file(chat_id, file_path, message_id):
+def handle_rename_file(chat_id, file_path):
     """Handle file upload for rename"""
     # Update session
-    if session_manager:
-        session_manager.update_session(
-            chat_id,
-            state=BotState.WAITING_FILENAME,
-            data={'file_path': file_path}
-        )
+    session_manager.update_session(
+        chat_id,
+        state=BotState.WAITING_FILENAME,
+        data={'file_path': file_path}
+    )
     
     bot.send_message(
         chat_id,
@@ -541,15 +583,14 @@ def handle_rename_file(chat_id, file_path, message_id):
         parse_mode='Markdown'
     )
 
-def handle_watermark_file(chat_id, file_path, message_id):
+def handle_watermark_file(chat_id, file_path):
     """Handle file upload for watermark"""
     # Update session
-    if session_manager:
-        session_manager.update_session(
-            chat_id,
-            state=BotState.WAITING_WATERMARK_TEXT,
-            data={'file_path': file_path}
-        )
+    session_manager.update_session(
+        chat_id,
+        state=BotState.WAITING_WATERMARK_TEXT,
+        data={'file_path': file_path}
+    )
     
     bot.send_message(
         chat_id,
@@ -564,10 +605,6 @@ def handle_text(message):
     chat_id = message.chat.id
     text = message.text.strip()
     
-    if not session_manager:
-        bot.reply_to(message, "❌ Session error. Please use /start")
-        return
-    
     session = session_manager.get_session(chat_id)
     if not session:
         bot.reply_to(message, "❌ Session expired. Please use /start")
@@ -579,8 +616,6 @@ def handle_text(message):
         handle_rename_filename(chat_id, text, session)
     elif state == BotState.WAITING_WATERMARK_TEXT:
         handle_watermark_text(chat_id, text, session)
-    elif state == BotState.WAITING_WATERMARK_OPACITY:
-        handle_watermark_custom_opacity(chat_id, text, session)
     else:
         # Default response
         bot.reply_to(
@@ -607,16 +642,12 @@ def handle_rename_filename(chat_id, new_name, session):
     
     try:
         # Create renamed file
-        with tempfile.NamedTemporaryFile(
-            suffix='.pdf',
-            delete=False,
-            dir=temp_manager.temp_dir
-        ) as tmp_file:
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_file:
             output_path = tmp_file.name
         
-        # Copy and rename
-        import shutil
-        shutil.copy2(file_path, output_path)
+        # Copy file
+        with open(file_path, 'rb') as src, open(output_path, 'wb') as dst:
+            dst.write(src.read())
         
         # Send file
         with open(output_path, 'rb') as file:
@@ -629,12 +660,14 @@ def handle_rename_filename(chat_id, new_name, session):
             )
         
         # Cleanup
-        if os.path.exists(file_path):
+        try:
             os.unlink(file_path)
-        os.unlink(output_path)
+            os.unlink(output_path)
+        except:
+            pass
         
         # Clear session
-        session_manager.clear_session(chat_id)
+        session_manager.update_session(chat_id, state=BotState.WAITING, data={})
         
         # Show menu
         bot.send_message(
@@ -645,7 +678,7 @@ def handle_rename_filename(chat_id, new_name, session):
         
     except Exception as e:
         logger.error(f"Rename error: {e}")
-        bot.send_message(chat_id, f"❌ Error: {str(e)}")
+        bot.send_message(chat_id, f"❌ Error: {str(e)[:200]}")
 
 def handle_watermark_text(chat_id, text, session):
     """Handle watermark text input"""
@@ -654,47 +687,27 @@ def handle_watermark_text(chat_id, text, session):
         return
     
     # Update session
-    session['data']['watermark_text'] = text
-    session_manager.update_session(chat_id, data=session['data'])
+    data = session.get('data', {})
+    data['watermark_text'] = text[:100]  # Limit length
+    session_manager.update_session(chat_id, data=data)
     
     # Ask for position
     bot.send_message(
         chat_id,
-        f"✅ Watermark text: *{text}*\n\n"
+        f"✅ Watermark text: *{text[:50]}*\n\n"
         "Now choose position for the watermark:",
         parse_mode='Markdown',
         reply_markup=get_watermark_position_menu()
     )
 
-def handle_watermark_custom_opacity(chat_id, text, session):
-    """Handle custom opacity input"""
-    try:
-        opacity = float(text)
-        if opacity < 0.1 or opacity > 1.0:
-            raise ValueError("Opacity must be between 0.1 and 1.0")
-        
-        bot.send_message(chat_id, f"✅ Opacity set to: {opacity}")
-        process_watermark(chat_id, opacity)
-        
-    except ValueError as e:
-        bot.send_message(
-            chat_id,
-            f"❌ Invalid opacity: {str(e)}\n"
-            "Please enter a number between 0.1 and 1.0"
-        )
-
 def process_watermark(chat_id, opacity):
     """Process watermark with all parameters"""
-    if not session_manager:
-        bot.send_message(chat_id, "❌ Session error")
-        return
-    
     session = session_manager.get_session(chat_id)
     if not session:
         bot.send_message(chat_id, "❌ Session expired")
         return
     
-    data = session['data']
+    data = session.get('data', {})
     
     if not all(k in data for k in ['file_path', 'watermark_text', 'position']):
         bot.send_message(chat_id, "❌ Missing watermark parameters")
@@ -709,11 +722,7 @@ def process_watermark(chat_id, opacity):
     
     try:
         # Create output file
-        with tempfile.NamedTemporaryFile(
-            suffix='_watermarked.pdf',
-            delete=False,
-            dir=temp_manager.temp_dir
-        ) as tmp_file:
+        with tempfile.NamedTemporaryFile(suffix='_watermarked.pdf', delete=False) as tmp_file:
             output_path = tmp_file.name
         
         # Add watermark
@@ -735,12 +744,14 @@ def process_watermark(chat_id, opacity):
             )
         
         # Cleanup
-        if os.path.exists(file_path):
+        try:
             os.unlink(file_path)
-        os.unlink(output_path)
+            os.unlink(output_path)
+        except:
+            pass
         
         # Clear session
-        session_manager.clear_session(chat_id)
+        session_manager.update_session(chat_id, state=BotState.WAITING, data={})
         
         # Show menu
         bot.send_message(
@@ -753,10 +764,10 @@ def process_watermark(chat_id, opacity):
         logger.error(f"Watermark error: {e}")
         bot.send_message(
             chat_id,
-            f"❌ Error adding watermark: {str(e)}"
+            f"❌ Error adding watermark: {str(e)[:200]}"
         )
 
-# Webhook Routes
+# Flask Routes
 @app.route('/')
 def index():
     return jsonify({
@@ -773,33 +784,48 @@ def health_check():
 def webhook():
     if request.headers.get('content-type') == 'application/json':
         json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
+        update = types.Update.de_json(json_string)
         bot.process_new_updates([update])
         return 'OK', 200
     return 'Bad Request', 400
 
 @app.route('/setwebhook', methods=['GET'])
 def set_webhook():
-    if WEBHOOK_URL:
-        bot.remove_webhook()
-        bot.set_webhook(url=WEBHOOK_URL)
-        return f'Webhook set to: {WEBHOOK_URL}'
-    return 'WEBHOOK_URL not set', 400
+    if RENDER_EXTERNAL_URL:
+        try:
+            bot.remove_webhook()
+            time.sleep(1)
+            webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
+            bot.set_webhook(url=webhook_url)
+            return f'Webhook set to: {webhook_url}'
+        except Exception as e:
+            return f'Error setting webhook: {str(e)}', 500
+    return 'RENDER_EXTERNAL_URL not set', 400
 
 # Main entry point
 if __name__ == '__main__':
+    # Get port from environment (Render provides this)
+    port = int(os.environ.get('PORT', 5000))
+    
     # Set webhook if in production
-    if WEBHOOK_URL and 'localhost' not in WEBHOOK_URL:
-        logger.info(f"Setting webhook to: {WEBHOOK_URL}")
-        bot.remove_webhook()
-        time.sleep(1)
-        bot.set_webhook(url=WEBHOOK_URL)
+    if RENDER_EXTERNAL_URL and 'localhost' not in RENDER_EXTERNAL_URL:
+        logger.info(f"Starting in production mode on port {port}")
+        logger.info(f"External URL: {RENDER_EXTERNAL_URL}")
         
-        # Start Flask server for Render
-        port = int(os.environ.get('PORT', 5000))
-        app.run(host='0.0.0.0', port=port)
+        # Try to set webhook
+        try:
+            webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
+            logger.info(f"Setting webhook to: {webhook_url}")
+            bot.remove_webhook()
+            time.sleep(1)
+            bot.set_webhook(url=webhook_url)
+        except Exception as e:
+            logger.error(f"Failed to set webhook: {e}")
+        
+        # Start Flask server
+        app.run(host='0.0.0.0', port=port, debug=False)
     else:
         # Use polling for local development
-        logger.info("Starting bot with polling...")
+        logger.info("Starting in development mode with polling...")
         bot.remove_webhook()
-        bot.infinity_polling()
+        bot.polling(none_stop=True, timeout=60)
