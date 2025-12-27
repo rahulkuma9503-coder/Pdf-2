@@ -4,15 +4,11 @@ services:
     env: python
     region: oregon
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
       - key: TELEGRAM_TOKEN
         sync: false
-      - key: RENDER_EXTERNAL_URL
-        fromService:
-          type: web
-          name: pdf-telegram-bot
-          property: url
     autoDeploy: true
-    healthCheckPath: /health
