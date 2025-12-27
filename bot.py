@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram PDF Utility Bot - Working Version
-Uses python-telegram-bot library (stable)
+Uses python-telegram-bot 13.15 (stable)
 """
 
 import os
@@ -10,9 +10,6 @@ import tempfile
 import logging
 from datetime import datetime
 from pathlib import Path
-
-# Add current directory to path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Configure logging
 logging.basicConfig(
@@ -24,12 +21,12 @@ logger = logging.getLogger(__name__)
 # Import Telegram bot
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
+    Updater,
     CommandHandler,
     MessageHandler,
+    Filters,
     CallbackQueryHandler,
-    ContextTypes,
-    filters
+    ConversationHandler
 )
 
 # Import PDF processor
@@ -37,49 +34,84 @@ try:
     from pdf_processor import PDFProcessor
     pdf_processor = PDFProcessor()
 except ImportError:
-    # Fallback if PDF processor not available
+    # Simple fallback PDF processor
     class PDFProcessor:
-        def merge_pdfs(self, *args, **kwargs):
-            raise Exception("PDF Processor not available")
+        def merge_pdfs(self, input_paths, output_path):
+            from PyPDF2 import PdfMerger
+            merger = PdfMerger()
+            for pdf in input_paths:
+                merger.append(pdf)
+            merger.write(output_path)
+            merger.close()
+        
+        def add_watermark(self, input_path, output_path, text, position='center', opacity=0.3):
+            from PyPDF2 import PdfReader, PdfWriter
+            from reportlab.pdfgen import canvas
+            from reportlab.lib.pagesizes import A4
+            from io import BytesIO
+            
+            # Create watermark
+            packet = BytesIO()
+            can = canvas.Canvas(packet, pagesize=A4)
+            can.setFillAlpha(opacity)
+            can.setFont("Helvetica-Bold", 36)
+            can.setFillColorRGB(0.5, 0.5, 0.5)
+            
+            # Position
+            if position == 'center':
+                can.drawCentredString(300, 400, text)
+            elif position == 'top':
+                can.drawCentredString(300, 700, text)
+            elif position == 'bottom':
+                can.drawCentredString(300, 100, text)
+            elif position == 'diagonal':
+                can.rotate(45)
+                can.drawCentredString(300, 300, text)
+            
+            can.save()
+            packet.seek(0)
+            
+            # Apply watermark
+            reader = PdfReader(input_path)
+            writer = PdfWriter()
+            
+            for page in reader.pages:
+                page.merge_page(PdfReader(packet).pages[0])
+                writer.add_page(page)
+            
+            with open(output_path, 'wb') as output_file:
+                writer.write(output_file)
     
     pdf_processor = PDFProcessor()
 
-# Load environment variables
-from dotenv import load_dotenv
-load_dotenv()
-
-# Configuration
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '')
-MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
-
-# User session data (simple memory storage)
-user_sessions = {}
+# Load environment variable
+TOKEN = os.getenv('TELEGRAM_TOKEN')
+if not TOKEN:
+    logger.error("TELEGRAM_TOKEN environment variable not set!")
+    print("ERROR: TELEGRAM_TOKEN not set!")
+    print("Please set the TELEGRAM_TOKEN environment variable on Render.com")
+    sys.exit(1)
 
 # Bot states
-class BotState:
-    WAITING = "waiting"
-    UPLOADING_MERGE = "uploading_merge"
-    UPLOADING_RENAME = "uploading_rename"
-    UPLOADING_WATERMARK = "uploading_watermark"
-    WAITING_FILENAME = "waiting_filename"
-    WAITING_WATERMARK_TEXT = "waiting_watermark_text"
-    WAITING_WATERMARK_POSITION = "waiting_watermark_position"
+STATE_WAITING = 0
+STATE_UPLOADING_MERGE = 1
+STATE_UPLOADING_RENAME = 2
+STATE_UPLOADING_WATERMARK = 3
+STATE_WAITING_FILENAME = 4
+STATE_WAITING_WATERMARK_TEXT = 5
+STATE_WAITING_WATERMARK_POSITION = 6
+
+# User session storage
+user_sessions = {}
 
 def get_user_session(chat_id):
     """Get or create user session"""
     if chat_id not in user_sessions:
         user_sessions[chat_id] = {
-            'state': BotState.WAITING,
+            'state': STATE_WAITING,
             'data': {}
         }
     return user_sessions[chat_id]
-
-def update_user_session(chat_id, **kwargs):
-    """Update user session"""
-    session = get_user_session(chat_id)
-    session.update(kwargs)
-    user_sessions[chat_id] = session
 
 def clear_user_session(chat_id):
     """Clear user session"""
@@ -87,7 +119,7 @@ def clear_user_session(chat_id):
         del user_sessions[chat_id]
 
 def get_main_menu():
-    """Create main menu keyboard"""
+    """Create main menu"""
     keyboard = [
         [
             InlineKeyboardButton("📄 Merge PDFs", callback_data='merge'),
@@ -96,12 +128,15 @@ def get_main_menu():
         [
             InlineKeyboardButton("💧 Add Watermark", callback_data='watermark'),
             InlineKeyboardButton("❓ Help", callback_data='help'),
+        ],
+        [
+            InlineKeyboardButton("🚫 Cancel", callback_data='cancel'),
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
 
 def get_watermark_position_menu():
-    """Create watermark position selection keyboard"""
+    """Create watermark position menu"""
     keyboard = [
         [
             InlineKeyboardButton("Center", callback_data='pos_center'),
@@ -114,585 +149,436 @@ def get_watermark_position_menu():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def start(update, context):
     """Handle /start command"""
     welcome_text = """
-🤖 *Welcome to PDF Utility Bot!*
+🤖 *PDF Utility Bot*
 
 I can help you with:
-• 📄 *Merge PDFs* - Combine multiple PDFs into one
-• ✏️ *Rename PDF* - Change PDF filename
-• 💧 *Add Watermark* - Add text watermark to PDF
+• 📄 Merge PDFs - Combine multiple PDFs
+• ✏️ Rename PDF - Change PDF filename
+• 💧 Add Watermark - Add text watermark
 
 *How to use:*
 1. Choose an option below
-2. Follow the step-by-step instructions
-3. Download your processed file
+2. Follow the instructions
+3. Download processed file
 
 ⚠️ *Limits:* Max 20MB per file, PDF only
 """
     
-    await update.message.reply_text(
+    update.message.reply_text(
         welcome_text,
         parse_mode='Markdown',
         reply_markup=get_main_menu()
     )
     
-    # Initialize session
     clear_user_session(update.effective_chat.id)
+    return STATE_WAITING
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def help_command(update, context):
     """Handle /help command"""
     help_text = """
-📚 *Available Commands:*
+📚 *Commands:*
 /start - Show main menu
-/help - Show this help message
-/cancel - Cancel current operation
+/help - Show help
+/cancel - Cancel operation
 
 🔧 *Features:*
-1. *Merge PDFs*: Upload multiple PDFs, then confirm to merge
-2. *Rename PDF*: Upload PDF and provide new filename
-3. *Add Watermark*: Upload PDF, then specify text and position
+1. *Merge PDFs*: Upload multiple PDFs to merge
+2. *Rename PDF*: Upload PDF and provide new name
+3. *Add Watermark*: Upload PDF, add text watermark
 
 ⚠️ *Important:*
-• Only PDF files accepted
-• Max file size: 20MB
-• Files are deleted after processing
+• Only PDF files
+• Max 20MB per file
+• Files deleted after processing
 """
     
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+    update.message.reply_text(help_text, parse_mode='Markdown')
+    return STATE_WAITING
 
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def cancel(update, context):
     """Handle /cancel command"""
     clear_user_session(update.effective_chat.id)
-    await update.message.reply_text(
-        "✅ Operation cancelled. What would you like to do next?",
+    update.message.reply_text(
+        "✅ Operation cancelled.",
         reply_markup=get_main_menu()
     )
+    return STATE_WAITING
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def button_handler(update, context):
     """Handle button callbacks"""
     query = update.callback_query
-    await query.answer()
+    query.answer()
     
     chat_id = update.effective_chat.id
-    data = query.data
     
-    if data == 'merge':
-        await handle_merge_start(query, context)
-    elif data == 'rename':
-        await handle_rename_start(query, context)
-    elif data == 'watermark':
-        await handle_watermark_start(query, context)
-    elif data == 'help':
-        await help_command(update, context)
-    elif data == 'confirm_merge':
-        await handle_merge_confirm(query, context)
-    elif data.startswith('pos_'):
-        await handle_watermark_position(query, context)
-
-async def handle_merge_start(query, context):
-    """Start merge operation"""
-    chat_id = query.message.chat_id
-    
-    update_user_session(
-        chat_id,
-        state=BotState.UPLOADING_MERGE,
-        data={'files': []}
-    )
-    
-    instruction = """
-📄 *Merge PDFs Mode*
-
-*How to merge:*
-1. Send me PDF files one by one
-2. Files will be merged in the order you send them
-3. I'll automatically merge when you send multiple files
-
-⚠️ *Note:* Only PDF files accepted, max 20MB each
-
-Send your first PDF file now...
-"""
-    
-    await query.edit_message_text(
-        instruction,
-        parse_mode='Markdown'
-    )
-
-async def handle_rename_start(query, context):
-    """Start rename operation"""
-    chat_id = query.message.chat_id
-    
-    update_user_session(
-        chat_id,
-        state=BotState.UPLOADING_RENAME
-    )
-    
-    instruction = """
-✏️ *Rename PDF Mode*
-
-Please send me the PDF file you want to rename.
-I'll ask for the new filename afterwards.
-
-⚠️ *Note:* Only PDF files accepted, max 20MB
-"""
-    
-    await query.edit_message_text(
-        instruction,
-        parse_mode='Markdown'
-    )
-
-async def handle_watermark_start(query, context):
-    """Start watermark operation"""
-    chat_id = query.message.chat_id
-    
-    update_user_session(
-        chat_id,
-        state=BotState.UPLOADING_WATERMARK
-    )
-    
-    instruction = """
-💧 *Add Watermark Mode*
-
-Please send me the PDF file you want to watermark.
-Then I'll ask for:
-1. Watermark text
-2. Position (center, top, bottom, diagonal)
-
-⚠️ *Note:* Only PDF files accepted, max 20MB
-"""
-    
-    await query.edit_message_text(
-        instruction,
-        parse_mode='Markdown'
-    )
-
-async def handle_merge_confirm(query, context):
-    """Process merge confirmation"""
-    chat_id = query.message.chat_id
-    session = get_user_session(chat_id)
-    
-    if not session or 'files' not in session.get('data', {}):
-        await query.message.reply_text("❌ No files to merge")
-        return
-    
-    files = session['data']['files']
-    if len(files) < 2:
-        await query.message.reply_text("❌ Need at least 2 PDFs to merge")
-        return
-    
-    await query.message.reply_text("🔄 Merging your PDFs... This may take a moment.")
-    
-    try:
-        # Create temp output file
-        with tempfile.NamedTemporaryFile(suffix='_merged.pdf', delete=False) as tmp_file:
-            output_path = tmp_file.name
-        
-        # Merge PDFs
-        pdf_processor.merge_pdfs(files, output_path)
-        
-        # Send merged file
-        with open(output_path, 'rb') as file:
-            await context.bot.send_document(
-                chat_id=chat_id,
-                document=file,
-                caption="✅ PDFs merged successfully!",
-                filename="merged_document.pdf"
-            )
-        
-        # Cleanup
-        try:
-            os.unlink(output_path)
-            for file_path in files:
-                if os.path.exists(file_path):
-                    os.unlink(file_path)
-        except:
-            pass
-        
-        # Clear session
-        clear_user_session(chat_id)
-        
-        # Show main menu
-        await query.message.reply_text(
-            "What would you like to do next?",
-            reply_markup=get_main_menu()
+    if query.data == 'merge':
+        user_sessions[chat_id] = {
+            'state': STATE_UPLOADING_MERGE,
+            'data': {'files': []}
+        }
+        query.edit_message_text(
+            text="📄 *Merge PDFs*\n\nSend me PDF files one by one. I'll merge them in order.\n\nSend first PDF now...",
+            parse_mode='Markdown'
         )
-        
-    except Exception as e:
-        logger.error(f"Merge error: {e}")
-        await query.message.reply_text(f"❌ Error merging PDFs: {str(e)[:100]}")
-
-async def handle_watermark_position(query, context):
-    """Handle watermark position selection"""
-    chat_id = query.message.chat_id
-    position = query.data.replace('pos_', '')
+        return STATE_UPLOADING_MERGE
     
-    session = get_user_session(chat_id)
-    if session:
-        data = session.get('data', {})
-        data['position'] = position
-        update_user_session(chat_id, data=data)
-    
-    # Process watermark
-    await process_watermark(chat_id, context)
-
-async def process_watermark(chat_id, context):
-    """Process watermark with all parameters"""
-    session = get_user_session(chat_id)
-    if not session:
-        await context.bot.send_message(chat_id, "❌ Session expired")
-        return
-    
-    data = session.get('data', {})
-    
-    if not all(k in data for k in ['file_path', 'watermark_text', 'position']):
-        await context.bot.send_message(chat_id, "❌ Missing watermark parameters")
-        return
-    
-    file_path = data['file_path']
-    if not os.path.exists(file_path):
-        await context.bot.send_message(chat_id, "❌ File not found")
-        return
-    
-    await context.bot.send_message(chat_id, "🔄 Adding watermark...")
-    
-    try:
-        # Create output file
-        with tempfile.NamedTemporaryFile(suffix='_watermarked.pdf', delete=False) as tmp_file:
-            output_path = tmp_file.name
-        
-        # Add watermark with fixed opacity
-        pdf_processor.add_watermark(
-            input_path=file_path,
-            output_path=output_path,
-            text=data['watermark_text'],
-            position=data['position'],
-            opacity=0.3  # Fixed opacity for simplicity
+    elif query.data == 'rename':
+        user_sessions[chat_id] = {
+            'state': STATE_UPLOADING_RENAME,
+            'data': {}
+        }
+        query.edit_message_text(
+            text="✏️ *Rename PDF*\n\nSend me the PDF file you want to rename.",
+            parse_mode='Markdown'
         )
-        
-        # Send file
-        with open(output_path, 'rb') as file:
-            await context.bot.send_document(
-                chat_id=chat_id,
-                document=file,
-                caption="✅ Watermark added successfully!",
-                filename="watermarked_document.pdf"
-            )
-        
-        # Cleanup
-        try:
-            os.unlink(file_path)
-            os.unlink(output_path)
-        except:
-            pass
-        
-        # Clear session
-        clear_user_session(chat_id)
-        
-        # Show menu
-        await context.bot.send_message(
-            chat_id,
-            "What would you like to do next?",
-            reply_markup=get_main_menu()
+        return STATE_UPLOADING_RENAME
+    
+    elif query.data == 'watermark':
+        user_sessions[chat_id] = {
+            'state': STATE_UPLOADING_WATERMARK,
+            'data': {}
+        }
+        query.edit_message_text(
+            text="💧 *Add Watermark*\n\nSend me the PDF file you want to watermark.",
+            parse_mode='Markdown'
         )
+        return STATE_UPLOADING_WATERMARK
+    
+    elif query.data == 'help':
+        help_command(update, context)
+        return STATE_WAITING
+    
+    elif query.data == 'cancel':
+        cancel(update, context)
+        return STATE_WAITING
+    
+    elif query.data.startswith('pos_'):
+        position = query.data.replace('pos_', '')
+        chat_id = update.effective_chat.id
         
-    except Exception as e:
-        logger.error(f"Watermark error: {e}")
-        await context.bot.send_message(
-            chat_id,
-            f"❌ Error adding watermark: {str(e)[:100]}"
-        )
+        if chat_id in user_sessions:
+            user_sessions[chat_id]['data']['position'] = position
+            
+            # Process watermark
+            process_watermark(chat_id, context.bot)
+        
+        return STATE_WAITING
+    
+    return STATE_WAITING
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def handle_document(update, context):
     """Handle uploaded PDF files"""
     chat_id = update.effective_chat.id
     document = update.message.document
     
-    # Check if it's a PDF
+    # Check if PDF
     if not document.file_name.lower().endswith('.pdf'):
-        await update.message.reply_text("❌ Please send a PDF file only.")
-        return
+        update.message.reply_text("❌ Please send a PDF file only.")
+        return STATE_WAITING
     
-    # Check file size
-    if document.file_size and document.file_size > MAX_FILE_SIZE:
-        await update.message.reply_text(
-            f"❌ File too large. Max size: {MAX_FILE_SIZE // 1024 // 1024}MB"
-        )
-        return
+    # Check size (20MB max)
+    if document.file_size > 20 * 1024 * 1024:
+        update.message.reply_text("❌ File too large. Max 20MB.")
+        return STATE_WAITING
     
     # Download file
-    await update.message.reply_text("📥 Downloading file...")
+    update.message.reply_text("📥 Downloading...")
     
     try:
-        file = await context.bot.get_file(document.file_id)
-        downloaded_file = await file.download_as_bytearray()
+        file = context.bot.get_file(document.file_id)
+        downloaded = file.download_as_bytearray()
         
-        # Save to temp file
-        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_file:
-            tmp_file.write(downloaded_file)
-            file_path = tmp_file.name
+        # Save temp file
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
+            f.write(downloaded)
+            temp_path = f.name
         
-        # Handle based on current state
-        session = get_user_session(chat_id)
-        state = session.get('state', BotState.WAITING)
+        # Handle based on state
+        if chat_id not in user_sessions:
+            update.message.reply_text("Please use /start first")
+            os.unlink(temp_path)
+            return STATE_WAITING
         
-        if state == BotState.UPLOADING_MERGE:
-            await handle_merge_file(chat_id, file_path, document.file_name, context)
-        elif state == BotState.UPLOADING_RENAME:
-            await handle_rename_file(chat_id, file_path, context)
-        elif state == BotState.UPLOADING_WATERMARK:
-            await handle_watermark_file(chat_id, file_path, context)
+        state = user_sessions[chat_id]['state']
+        
+        if state == STATE_UPLOADING_MERGE:
+            return handle_merge_doc(update, context, chat_id, temp_path, document.file_name)
+        
+        elif state == STATE_UPLOADING_RENAME:
+            user_sessions[chat_id]['data']['file_path'] = temp_path
+            user_sessions[chat_id]['state'] = STATE_WAITING_FILENAME
+            update.message.reply_text("✅ PDF received! Now send me the new filename (without .pdf):")
+            return STATE_WAITING_FILENAME
+        
+        elif state == STATE_UPLOADING_WATERMARK:
+            user_sessions[chat_id]['data']['file_path'] = temp_path
+            user_sessions[chat_id]['state'] = STATE_WAITING_WATERMARK_TEXT
+            update.message.reply_text("✅ PDF received! Now send me the watermark text:")
+            return STATE_WAITING_WATERMARK_TEXT
+        
         else:
-            await update.message.reply_text(
-                "Please select an option from the menu first.",
-                reply_markup=get_main_menu()
-            )
-            os.unlink(file_path)
-            
+            update.message.reply_text("Please select an option first", reply_markup=get_main_menu())
+            os.unlink(temp_path)
+            return STATE_WAITING
+    
     except Exception as e:
-        logger.error(f"File handling error: {e}")
-        await update.message.reply_text(f"❌ Error processing file: {str(e)[:100]}")
+        logger.error(f"Error: {e}")
+        update.message.reply_text(f"❌ Error: {str(e)[:100]}")
+        return STATE_WAITING
 
-async def handle_merge_file(chat_id, file_path, file_name, context):
-    """Handle file upload for merge"""
-    session = get_user_session(chat_id)
-    if not session:
-        await context.bot.send_message(chat_id, "❌ Session expired. Please start again.")
-        return
+def handle_merge_doc(update, context, chat_id, file_path, file_name):
+    """Handle merge document"""
+    user_sessions[chat_id]['data']['files'].append(file_path)
+    file_count = len(user_sessions[chat_id]['data']['files'])
     
-    # Add file to session
-    data = session.get('data', {})
-    if 'files' not in data:
-        data['files'] = []
+    update.message.reply_text(
+        f"✅ Added: {file_name}\nTotal files: {file_count}\n\nSend another PDF or wait for merge..."
+    )
     
-    data['files'].append(file_path)
-    update_user_session(chat_id, data=data)
-    
-    # Show status
-    file_count = len(data['files'])
-    
+    # Auto-merge after 2 files
     if file_count >= 2:
-        # Auto-merge when we have at least 2 files
-        await context.bot.send_message(
-            chat_id,
-            f"📄 *{file_name}* added!\n"
-            f"Total files: {file_count}\n\n"
-            "Merging files now...",
-            parse_mode='Markdown'
-        )
-        
-        # Process merge
-        await process_merge(chat_id, context, data['files'])
-    else:
-        await context.bot.send_message(
-            chat_id,
-            f"📄 *{file_name}* added!\n"
-            f"Total files: {file_count}\n\n"
-            "Send another PDF to merge, or wait a moment...",
-            parse_mode='Markdown'
-        )
+        process_merge(chat_id, context.bot)
+    
+    return STATE_UPLOADING_MERGE
 
-async def process_merge(chat_id, context, files):
-    """Process the merge operation"""
+def process_merge(chat_id, bot):
+    """Process merge operation"""
     try:
-        # Create temp output file
-        with tempfile.NamedTemporaryFile(suffix='_merged.pdf', delete=False) as tmp_file:
-            output_path = tmp_file.name
+        files = user_sessions[chat_id]['data']['files']
         
-        # Merge PDFs
+        if len(files) < 2:
+            bot.send_message(chat_id, "Need at least 2 PDFs to merge")
+            return
+        
+        bot.send_message(chat_id, "🔄 Merging PDFs...")
+        
+        # Create output file
+        with tempfile.NamedTemporaryFile(suffix='_merged.pdf', delete=False) as f:
+            output_path = f.name
+        
+        # Merge
         pdf_processor.merge_pdfs(files, output_path)
         
-        # Send merged file
+        # Send result
         with open(output_path, 'rb') as file:
-            await context.bot.send_document(
+            bot.send_document(
                 chat_id=chat_id,
                 document=file,
-                caption="✅ PDFs merged successfully!",
-                filename="merged_document.pdf"
+                caption="✅ Merged successfully!",
+                filename="merged.pdf"
             )
         
         # Cleanup
-        try:
-            os.unlink(output_path)
-            for file_path in files:
-                if os.path.exists(file_path):
-                    os.unlink(file_path)
-        except:
-            pass
+        for f in files:
+            try:
+                os.unlink(f)
+            except:
+                pass
+        os.unlink(output_path)
         
         # Clear session
         clear_user_session(chat_id)
-        
-        # Show menu
-        await context.bot.send_message(
-            chat_id,
-            "What would you like to do next?",
-            reply_markup=get_main_menu()
-        )
-        
+        bot.send_message(chat_id, "✅ Done! What next?", reply_markup=get_main_menu())
+    
     except Exception as e:
         logger.error(f"Merge error: {e}")
-        await context.bot.send_message(chat_id, f"❌ Error merging PDFs: {str(e)[:100]}")
+        bot.send_message(chat_id, f"❌ Merge failed: {str(e)[:100]}")
 
-async def handle_rename_file(chat_id, file_path, context):
-    """Handle file upload for rename"""
-    # Update session
-    update_user_session(
-        chat_id,
-        state=BotState.WAITING_FILENAME,
-        data={'file_path': file_path}
-    )
-    
-    await context.bot.send_message(
-        chat_id,
-        "✅ PDF received!\n\n"
-        "Now please send me the *new filename* (without .pdf extension):\n"
-        "Example: `my_document_v2`",
-        parse_mode='Markdown'
-    )
-
-async def handle_watermark_file(chat_id, file_path, context):
-    """Handle file upload for watermark"""
-    # Update session
-    update_user_session(
-        chat_id,
-        state=BotState.WAITING_WATERMARK_TEXT,
-        data={'file_path': file_path}
-    )
-    
-    await context.bot.send_message(
-        chat_id,
-        "✅ PDF received!\n\n"
-        "Now please send me the *watermark text* you want to add:",
-        parse_mode='Markdown'
-    )
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def handle_text(update, context):
     """Handle text messages"""
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
     
-    session = get_user_session(chat_id)
-    if not session:
-        await update.message.reply_text("❌ Session expired. Please use /start")
-        return
+    if chat_id not in user_sessions:
+        update.message.reply_text("Please use /start first", reply_markup=get_main_menu())
+        return STATE_WAITING
     
-    state = session.get('state', BotState.WAITING)
+    state = user_sessions[chat_id]['state']
     
-    if state == BotState.WAITING_FILENAME:
-        await handle_rename_filename(chat_id, text, session, context)
-    elif state == BotState.WAITING_WATERMARK_TEXT:
-        await handle_watermark_text(chat_id, text, session, context)
-    else:
-        await update.message.reply_text(
-            "Please select an option from the menu:",
-            reply_markup=get_main_menu()
+    if state == STATE_WAITING_FILENAME:
+        return handle_rename(update, context, chat_id, text)
+    
+    elif state == STATE_WAITING_WATERMARK_TEXT:
+        user_sessions[chat_id]['data']['watermark_text'] = text
+        user_sessions[chat_id]['state'] = STATE_WAITING_WATERMARK_POSITION
+        update.message.reply_text(
+            f"✅ Text: {text[:50]}\n\nChoose position:",
+            reply_markup=get_watermark_position_menu()
         )
+        return STATE_WAITING_WATERMARK_POSITION
+    
+    else:
+        update.message.reply_text("Please select an option", reply_markup=get_main_menu())
+        return STATE_WAITING
 
-async def handle_rename_filename(chat_id, new_name, session, context):
-    """Handle rename filename input"""
-    file_path = session['data'].get('file_path')
-    if not file_path or not os.path.exists(file_path):
-        await context.bot.send_message(chat_id, "❌ File not found. Please upload again.")
-        return
-    
-    # Clean filename
-    new_name = new_name.replace('.pdf', '').strip()
-    if not new_name:
-        await context.bot.send_message(chat_id, "❌ Invalid filename. Please try again.")
-        return
-    
-    await context.bot.send_message(chat_id, "🔄 Renaming file...")
-    
+def handle_rename(update, context, chat_id, new_name):
+    """Handle rename operation"""
     try:
-        # Create renamed file
-        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_file:
-            output_path = tmp_file.name
+        file_path = user_sessions[chat_id]['data'].get('file_path')
+        if not file_path or not os.path.exists(file_path):
+            update.message.reply_text("❌ File not found")
+            return STATE_WAITING
         
-        # Copy file
+        # Clean name
+        new_name = new_name.replace('.pdf', '').strip()
+        if not new_name:
+            update.message.reply_text("❌ Invalid name")
+            return STATE_WAITING
+        
+        update.message.reply_text("🔄 Renaming...")
+        
+        # Create output file
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
+            output_path = f.name
+        
+        # Copy file (simulated rename)
         with open(file_path, 'rb') as src, open(output_path, 'wb') as dst:
             dst.write(src.read())
         
-        # Send file
+        # Send result
         with open(output_path, 'rb') as file:
-            await context.bot.send_document(
+            context.bot.send_document(
                 chat_id=chat_id,
                 document=file,
-                caption=f"✅ Renamed to: *{new_name}.pdf*",
-                parse_mode='Markdown',
+                caption=f"✅ Renamed to: {new_name}.pdf",
                 filename=f"{new_name}.pdf"
             )
         
         # Cleanup
-        try:
-            os.unlink(file_path)
-            os.unlink(output_path)
-        except:
-            pass
+        os.unlink(file_path)
+        os.unlink(output_path)
         
         # Clear session
         clear_user_session(chat_id)
-        
-        # Show menu
-        await context.bot.send_message(
-            chat_id,
-            "What would you like to do next?",
-            reply_markup=get_main_menu()
-        )
-        
+        update.message.reply_text("✅ Done! What next?", reply_markup=get_main_menu())
+        return STATE_WAITING
+    
     except Exception as e:
         logger.error(f"Rename error: {e}")
-        await context.bot.send_message(chat_id, f"❌ Error: {str(e)[:100]}")
+        update.message.reply_text(f"❌ Error: {str(e)[:100]}")
+        return STATE_WAITING
 
-async def handle_watermark_text(chat_id, text, session, context):
-    """Handle watermark text input"""
-    if not text:
-        await context.bot.send_message(chat_id, "❌ Please provide watermark text.")
-        return
+def process_watermark(chat_id, bot):
+    """Process watermark operation"""
+    try:
+        data = user_sessions[chat_id]['data']
+        file_path = data.get('file_path')
+        text = data.get('watermark_text')
+        position = data.get('position')
+        
+        if not all([file_path, text, position]):
+            bot.send_message(chat_id, "❌ Missing data")
+            return
+        
+        if not os.path.exists(file_path):
+            bot.send_message(chat_id, "❌ File not found")
+            return
+        
+        bot.send_message(chat_id, "🔄 Adding watermark...")
+        
+        # Create output file
+        with tempfile.NamedTemporaryFile(suffix='_watermarked.pdf', delete=False) as f:
+            output_path = f.name
+        
+        # Add watermark
+        pdf_processor.add_watermark(file_path, output_path, text, position)
+        
+        # Send result
+        with open(output_path, 'rb') as file:
+            bot.send_document(
+                chat_id=chat_id,
+                document=file,
+                caption="✅ Watermark added!",
+                filename="watermarked.pdf"
+            )
+        
+        # Cleanup
+        os.unlink(file_path)
+        os.unlink(output_path)
+        
+        # Clear session
+        clear_user_session(chat_id)
+        bot.send_message(chat_id, "✅ Done! What next?", reply_markup=get_main_menu())
     
-    # Update session
-    data = session.get('data', {})
-    data['watermark_text'] = text[:100]  # Limit length
-    update_user_session(chat_id, data=data, state=BotState.WAITING_WATERMARK_POSITION)
-    
-    # Ask for position
-    await context.bot.send_message(
-        chat_id,
-        f"✅ Watermark text: *{text[:50]}*\n\n"
-        "Now choose position for the watermark:",
-        parse_mode='Markdown',
-        reply_markup=get_watermark_position_menu()
-    )
+    except Exception as e:
+        logger.error(f"Watermark error: {e}")
+        bot.send_message(chat_id, f"❌ Error: {str(e)[:100]}")
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def error_handler(update, context):
     """Handle errors"""
     logger.error(f"Update {update} caused error {context.error}")
     
     if update and update.effective_chat:
-        await context.bot.send_message(
+        context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text="❌ An error occurred. Please try again or use /start"
+            text="❌ An error occurred. Use /start to restart."
         )
 
 def main():
     """Start the bot"""
-    # Create application
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    # Check token
+    if not TOKEN:
+        print("ERROR: TELEGRAM_TOKEN not set!")
+        print("Please set the TELEGRAM_TOKEN environment variable")
+        print("On Render.com: Environment → Add environment variable")
+        sys.exit(1)
     
-    # Add handlers
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("cancel", cancel_command))
-    application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    print(f"Starting PDF Utility Bot with token: {TOKEN[:10]}...")
     
-    # Add error handler
-    application.add_error_handler(error_handler)
+    # Create updater
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
     
-    # Start the bot
-    print("Starting bot...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Add conversation handler
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={
+            STATE_WAITING: [
+                CallbackQueryHandler(button_handler),
+                CommandHandler('help', help_command),
+                CommandHandler('cancel', cancel),
+                MessageHandler(Filters.document, handle_document),
+                MessageHandler(Filters.text, handle_text),
+            ],
+            STATE_UPLOADING_MERGE: [
+                MessageHandler(Filters.document, handle_document),
+                CommandHandler('cancel', cancel),
+            ],
+            STATE_UPLOADING_RENAME: [
+                MessageHandler(Filters.document, handle_document),
+                CommandHandler('cancel', cancel),
+            ],
+            STATE_UPLOADING_WATERMARK: [
+                MessageHandler(Filters.document, handle_document),
+                CommandHandler('cancel', cancel),
+            ],
+            STATE_WAITING_FILENAME: [
+                MessageHandler(Filters.text, handle_text),
+                CommandHandler('cancel', cancel),
+            ],
+            STATE_WAITING_WATERMARK_TEXT: [
+                MessageHandler(Filters.text, handle_text),
+                CommandHandler('cancel', cancel),
+            ],
+            STATE_WAITING_WATERMARK_POSITION: [
+                CallbackQueryHandler(button_handler),
+                CommandHandler('cancel', cancel),
+            ],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+    
+    dp.add_handler(conv_handler)
+    dp.add_error_handler(error_handler)
+    
+    # Start bot
+    print("Bot is starting...")
+    updater.start_polling()
+    print("Bot is running! Press Ctrl+C to stop.")
+    updater.idle()
 
 if __name__ == '__main__':
     main()
